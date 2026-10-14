@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Iris Inference</title>
+<style>
+  :root { --bg:#f7f7f8; --card:#fff; --text:#1c1c1e; --muted:#6b6b70; --accent:#2f6fde; --border:#e3e3e6; --err:#c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141416; --card:#1e1e21; --text:#ececef; --muted:#9a9aa0; --accent:#6c9cff; --border:#2e2e33; --err:#ff6b6b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:32px 16px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .muted { color:var(--muted); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px; margin-top:16px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
+  input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
+  button { padding:8px 14px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text); font:inherit; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .result h2 { font-size:20px; margin:0 0 12px; }
+  .bar { display:grid; grid-template-columns:90px 1fr 64px; align-items:center; gap:8px; margin:6px 0; font-size:14px; }
+  .track { height:10px; background:var(--bg); border-radius:5px; overflow:hidden; border:1px solid var(--border); }
+  .fill { height:100%; background:var(--accent); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .error { color:var(--err); }
+  code { font-size:13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Iris Inference</h1>
+  <div class="muted" id="model">загрузка метаданных…</div>
+
+  <form class="card" id="form">
+    <div class="grid" id="fields"></div>
+    <div class="row">
+      <button class="primary" type="submit">Предсказать</button>
+      <button type="button" data-preset="5.1,3.5,1.4,0.2">setosa</button>
+      <button type="button" data-preset="5.9,3.0,4.2,1.5">versicolor</button>
+      <button type="button" data-preset="6.7,3.0,5.2,2.3">virginica</button>
+    </div>
+  </form>
+
+  <div class="card result" id="result" hidden></div>
+
+  <p class="muted">API: <code>POST /v1/predict</code>, <code>GET /v1/model</code>, <code>GET /healthz</code>, <code>GET /readyz</code></p>
+</main>
+<script>
+const fields = document.getElementById('fields');
+const result = document.getElementById('result');
+let features = [];
+
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function init() {
+  const r = await fetch('/v1/model');
+  if (!r.ok) { document.getElementById('model').textContent = 'модель не загружена'; return; }
+  const md = await r.json();
+  features = md.features;
+  const m = md.metrics || {};
+  document.getElementById('model').textContent =
+    `${md.name} v${md.version} · accuracy ${m.accuracy ?? '—'} · f1 ${m.f1_macro ?? '—'} · sha256 ${md.sha256.slice(0, 12)}…`;
+  fields.innerHTML = features.map((f, i) =>
+    `<div><label for="f${i}">${esc(f.name)} <span>[${f.min}–${f.max}]</span></label>
+     <input id="f${i}" type="number" step="0.1" required></div>`).join('');
+  setValues([5.1, 3.5, 1.4, 0.2]);
+}
+
+function setValues(vals) { vals.forEach((v, i) => { const el = document.getElementById('f' + i); if (el) el.value = v; }); }
+
+document.querySelectorAll('[data-preset]').forEach(b =>
+  b.addEventListener('click', () => { setValues(b.dataset.preset.split(',').map(Number)); document.getElementById('form').requestSubmit(); }));
+
+document.getElementById('form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const row = features.map((_, i) => Number(document.getElementById('f' + i).value));
+  const t0 = performance.now();
+  const r = await fetch('/v1/predict', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ instances: [row] }) });
+  const ms = (performance.now() - t0).toFixed(1);
+  const body = await r.json();
+  result.hidden = false;
+  if (!r.ok) { result.innerHTML = `<div class="error">${r.status}: ${esc(body.error)}</div>`; return; }
+  const p = body.predictions[0];
+  const md = await (await fetch('/v1/model')).json();
+  result.innerHTML = `<h2>${esc(p.class)}</h2>` +
+    p.probabilities.map((v, i) => `<div class="bar"><span>${esc(md.classes[i])}</span>
+      <div class="track"><div class="fill" style="width:${(v * 100).toFixed(1)}%"></div></div>
+      <span class="num">${(v * 100).toFixed(1)}%</span></div>`).join('') +
+    `<div class="muted" style="margin-top:10px">${ms} мс · request_id ${esc(r.headers.get('X-Request-ID'))}</div>`;
+});
+
+init();
+</script>
+</body>
+</html>

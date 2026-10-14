@@ -1,0 +1,36 @@
+{
+  "name": "iris",
+  "version": "1",
+  "sha256": "4a3172bbb726efca8872db6742b31f809365823ca0a94deb4afdaf8d0e67bcfd",
+  "features": [
+    {
+      "name": "sepal_length",
+      "min": 0.0,
+      "max": 15.8
+    },
+    {
+      "name": "sepal_width",
+      "min": 0.0,
+      "max": 8.8
+    },
+    {
+      "name": "petal_length",
+      "min": 0.0,
+      "max": 13.8
+    },
+    {
+      "name": "petal_width",
+      "min": 0.0,
+      "max": 5.0
+    }
+  ],
+  "classes": [
+    "setosa",
+    "versicolor",
+    "virginica"
+  ],
+  "metrics": {
+    "accuracy": 0.9333,
+    "f1_macro": 0.9333
+  }
+}
