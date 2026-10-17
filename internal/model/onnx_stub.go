@@ -12,8 +12,8 @@ import (
 
 var errNoCGO = errors.New("onnx runtime requires a cgo build (CGO_ENABLED=1)")
 
-func InitRuntime(string) error  { return errNoCGO }
-func DestroyRuntime() error     { return nil }
+func InitRuntime(string) error { return errNoCGO }
+func DestroyRuntime() error    { return nil }
 
 type ONNXPredictor struct{}
 

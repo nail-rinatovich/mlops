@@ -1,0 +1,18 @@
+# Все текстовые файлы хранятся и выкачиваются с LF — иначе Git на Windows
+# превратит их в CRLF, что ломает Dockerfile/shell-скрипты внутри Linux-контейнеров.
+* text=auto eol=lf
+
+# Windows-скрипты оставляем с CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# ML-артефакты и прочие бинарники — никогда не трогать
+*.onnx binary
+*.pkl binary
+*.joblib binary
+*.pt binary
+*.parquet binary
+*.png binary
+*.jpg binary
+*.webp binary

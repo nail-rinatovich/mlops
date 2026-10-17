@@ -4,6 +4,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -16,6 +17,12 @@ type Config struct {
 	MaxBodyBytes    int64         // MAX_BODY_BYTES
 	ShutdownTimeout time.Duration // SHUTDOWN_TIMEOUT
 	LogLevel        string        // LOG_LEVEL: debug|info|warn|error
+
+	// Режим реестра: если RegistryURL задан, модель берётся из реестра, а не из ModelDir.
+	RegistryURL  string        // REGISTRY_URL
+	ModelName    string        // MODEL_NAME: какую модель брать из реестра
+	PollInterval time.Duration // REGISTRY_POLL_INTERVAL: как часто проверять новую production-версию
+	CacheDir     string        // MODEL_CACHE_DIR: куда скачивать модели
 }
 
 // Load читает конфигурацию через getenv (в проде — os.Getenv, в тестах — подмена).
@@ -28,6 +35,10 @@ func Load(getenv func(string) string) (Config, error) {
 		ModelDir:   withDefault(getenv("MODEL_DIR"), "models/iris"),
 		ORTLibPath: getenv("ORT_LIB_PATH"),
 		LogLevel:   withDefault(getenv("LOG_LEVEL"), "info"),
+
+		RegistryURL: getenv("REGISTRY_URL"),
+		ModelName:   withDefault(getenv("MODEL_NAME"), "iris"),
+		CacheDir:    withDefault(getenv("MODEL_CACHE_DIR"), filepath.Join(os.TempDir(), "mlops-models")),
 	}
 
 	var err error
@@ -47,6 +58,16 @@ func Load(getenv func(string) string) (Config, error) {
 	if v := getenv("SHUTDOWN_TIMEOUT"); v != "" {
 		if c.ShutdownTimeout, err = time.ParseDuration(v); err != nil {
 			return Config{}, fmt.Errorf("SHUTDOWN_TIMEOUT: %w", err)
+		}
+	}
+
+	c.PollInterval = 10 * time.Second
+	if v := getenv("REGISTRY_POLL_INTERVAL"); v != "" {
+		if c.PollInterval, err = time.ParseDuration(v); err != nil {
+			return Config{}, fmt.Errorf("REGISTRY_POLL_INTERVAL: %w", err)
+		}
+		if c.PollInterval < time.Second {
+			return Config{}, fmt.Errorf("REGISTRY_POLL_INTERVAL must be at least 1s, got %s", c.PollInterval)
 		}
 	}
 	return c, nil

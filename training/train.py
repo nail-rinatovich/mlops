@@ -26,6 +26,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="/out")
     parser.add_argument("--version", default="1")
+    parser.add_argument("--c", type=float, default=1.0,
+                        help="сила регуляризации LogisticRegression (меньше = сильнее)")
     args = parser.parse_args()
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -37,10 +39,11 @@ def main() -> None:
         X, y, test_size=0.2, random_state=SEED, stratify=y
     )
 
-    clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, random_state=SEED))
+    clf = make_pipeline(StandardScaler(), LogisticRegression(C=args.c, max_iter=1000, random_state=SEED))
     clf.fit(X_train, y_train)
     pred = clf.predict(X_test)
     metrics = {
+        "C": args.c,
         "accuracy": round(float(accuracy_score(y_test, pred)), 4),
         "f1_macro": round(float(f1_score(y_test, pred, average="macro")), 4),
     }

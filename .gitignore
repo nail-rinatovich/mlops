@@ -1,0 +1,72 @@
+# --- Go: собранные бинарники ---
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/inference
+/cmd/*/__debug_bin*
+__debug_bin*
+
+# --- Go: тесты и профилирование ---
+*.test
+*.out
+coverage.*
+*.coverprofile
+*.prof
+*.pprof
+cpu.pprof
+mem.pprof
+
+# --- Go: локальные workspace-файлы ---
+go.work
+go.work.sum
+
+# --- Python (training/) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+
+# --- ML-артефакты ---
+# models/iris/ коммитим НАМЕРЕННО: файлы маленькие (~3 КБ), их копирует Dockerfile,
+# а samples.json нужен тесту паритета. Крупные и промежуточные артефакты — не коммитим.
+/models/*
+!/models/iris/
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.joblib
+mlruns/
+
+# --- Локальные данные сервисов (MinIO, PostgreSQL и т.п. в следующих проектах) ---
+/data/
+/.volumes/
+
+# --- Секреты и локальные настройки окружения ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- IDE и редакторы ---
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+
+# --- ОС ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Claude Code: локальные (личные) настройки ---
+.claude/settings.local.json

@@ -41,11 +41,16 @@ type Metadata struct {
 
 // LoadMetadata читает metadata.json из каталога модели.
 func LoadMetadata(dir string) (Metadata, error) {
-	var md Metadata
 	b, err := os.ReadFile(filepath.Join(dir, "metadata.json"))
 	if err != nil {
-		return md, fmt.Errorf("read metadata: %w", err)
+		return Metadata{}, fmt.Errorf("read metadata: %w", err)
 	}
+	return ParseMetadata(b)
+}
+
+// ParseMetadata разбирает и проверяет содержимое metadata.json.
+func ParseMetadata(b []byte) (Metadata, error) {
+	var md Metadata
 	if err := json.Unmarshal(b, &md); err != nil {
 		return md, fmt.Errorf("parse metadata: %w", err)
 	}

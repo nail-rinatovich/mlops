@@ -9,8 +9,10 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
+	"mlops/internal/httpx"
 	"mlops/internal/model"
 )
 
@@ -24,35 +26,72 @@ type Options struct {
 	MaxBodyBytes int64
 }
 
-// Server держит текущую модель в atomic-указателе: её можно заменить на лету
-// (пригодится для горячей перезагрузки из реестра в проекте 2).
+// Server держит текущую модель в atomic-указателе, поэтому её можно заменить на лету.
 type Server struct {
 	opts   Options
 	log    *slog.Logger
 	active atomic.Pointer[loaded]
+	swapMu sync.Mutex // сериализует SetPredictor/Close между собой
 }
 
-type loaded struct{ p model.Predictor }
+// loaded — загруженная модель со счётчиком использования. Запросы держат RLock
+// на время инференса; при замене модели Lock дожидается их завершения, и только
+// после этого старая модель закрывается. Так ни один запрос не обратится
+// к уже освобождённой памяти ONNX Runtime.
+type loaded struct {
+	p      model.Predictor
+	mu     sync.RWMutex
+	closed bool
+}
 
 func New(opts Options, log *slog.Logger) *Server {
 	return &Server{opts: opts, log: log}
 }
 
-// SetPredictor атомарно подменяет модель и возвращает предыдущую (или nil).
-func (s *Server) SetPredictor(p model.Predictor) model.Predictor {
-	old := s.active.Swap(&loaded{p: p})
-	if old == nil {
-		return nil
-	}
-	return old.p
+// SetPredictor атомарно подменяет модель. Предыдущая модель закрывается после того,
+// как завершатся все запросы, которые успели её взять.
+func (s *Server) SetPredictor(p model.Predictor) {
+	s.swapMu.Lock()
+	defer s.swapMu.Unlock()
+	s.retire(s.active.Swap(&loaded{p: p}))
 }
 
-func (s *Server) predictor() model.Predictor {
-	if l := s.active.Load(); l != nil {
-		return l.p
-	}
-	return nil
+// Close выгружает текущую модель (при остановке сервиса).
+func (s *Server) Close() {
+	s.swapMu.Lock()
+	defer s.swapMu.Unlock()
+	s.retire(s.active.Swap(nil))
 }
+
+func (s *Server) retire(old *loaded) {
+	if old == nil {
+		return
+	}
+	old.mu.Lock() // ждём, пока доработают запросы на старой модели
+	old.closed = true
+	old.mu.Unlock()
+	if err := old.p.Close(); err != nil {
+		s.log.Error("close predictor", "err", err)
+	}
+}
+
+// acquire берёт текущую модель для одного запроса. Вызывающий обязан вызвать release.
+// Если модель успели закрыть между Load и RLock, берём уже новую.
+func (s *Server) acquire() (*loaded, bool) {
+	for {
+		l := s.active.Load()
+		if l == nil {
+			return nil, false
+		}
+		l.mu.RLock()
+		if !l.closed {
+			return l, true
+		}
+		l.mu.RUnlock()
+	}
+}
+
+func (l *loaded) release() { l.mu.RUnlock() }
 
 // Handler возвращает роутер со всеми middleware.
 func (s *Server) Handler() http.Handler {
@@ -60,14 +99,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/predict", s.handlePredict)
 	mux.HandleFunc("GET /v1/model", s.handleModel)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(indexHTML)
 	})
-	return requestID(recoverer(s.log, logging(s.log, mux)))
+	return httpx.Wrap(s.log, mux)
 }
 
 type predictRequest struct {
@@ -85,38 +124,39 @@ type predictResponse struct {
 }
 
 func (s *Server) handlePredict(w http.ResponseWriter, r *http.Request) {
-	p := s.predictor()
-	if p == nil {
-		writeError(w, http.StatusServiceUnavailable, "model is not loaded")
-		return
-	}
-
+	// Тело читаем до захвата модели: медленный клиент не должен задерживать её замену.
 	r.Body = http.MaxBytesReader(w, r.Body, s.opts.MaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	var req predictRequest
 	if err := dec.Decode(&req); err != nil {
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			httpx.WriteError(w, http.StatusRequestEntityTooLarge, "request body too large")
 			return
 		}
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		httpx.WriteError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	md := p.Metadata()
+	l, ok := s.acquire()
+	if !ok {
+		httpx.WriteError(w, http.StatusServiceUnavailable, "model is not loaded")
+		return
+	}
+	md := l.p.Metadata()
 	if err := validate(req.Instances, md.Features, s.opts.MaxBatch); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		l.release()
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	preds, err := p.Predict(r.Context(), req.Instances)
+	preds, err := l.p.Predict(r.Context(), req.Instances)
+	l.release()
 	if err != nil {
-		s.log.ErrorContext(r.Context(), "predict failed", "err", err, "request_id", requestIDFrom(r.Context()))
-		writeError(w, http.StatusInternalServerError, "prediction failed")
+		s.log.ErrorContext(r.Context(), "predict failed", "err", err, "request_id", httpx.RequestID(r.Context()))
+		httpx.WriteError(w, http.StatusInternalServerError, "prediction failed")
 		return
 	}
-	writeJSON(w, http.StatusOK, predictResponse{
+	httpx.WriteJSON(w, http.StatusOK, predictResponse{
 		Model:       modelRef{Name: md.Name, Version: md.Version},
 		Predictions: preds,
 	})
@@ -147,31 +187,29 @@ func validate(batch [][]float32, features []model.Feature, maxBatch int) error {
 	return nil
 }
 
+func (s *Server) metadata() (model.Metadata, bool) {
+	l, ok := s.acquire()
+	if !ok {
+		return model.Metadata{}, false
+	}
+	defer l.release()
+	return l.p.Metadata(), true
+}
+
 func (s *Server) handleModel(w http.ResponseWriter, _ *http.Request) {
-	p := s.predictor()
-	if p == nil {
-		writeError(w, http.StatusServiceUnavailable, "model is not loaded")
+	md, ok := s.metadata()
+	if !ok {
+		httpx.WriteError(w, http.StatusServiceUnavailable, "model is not loaded")
 		return
 	}
-	writeJSON(w, http.StatusOK, p.Metadata())
+	httpx.WriteJSON(w, http.StatusOK, md)
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	p := s.predictor()
-	if p == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
+	md, ok := s.metadata()
+	if !ok {
+		httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not ready"})
 		return
 	}
-	md := p.Metadata()
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready", "model": md.Name, "version": md.Version})
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ready", "model": md.Name, "version": md.Version})
 }

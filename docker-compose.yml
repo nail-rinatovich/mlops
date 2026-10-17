@@ -1,0 +1,59 @@
+# Локальный стенд проекта 2: реестр моделей + inference с горячей заменой модели.
+# Пароли и ключи здесь только для локальной разработки.
+name: mlops
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: mlops
+      POSTGRES_PASSWORD: mlops
+      POSTGRES_DB: registry
+    ports: ["5433:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlops -d registry"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # S3-совместимое хранилище. Официальные образы MinIO больше не публикуются,
+  # RustFS повторяет его интерфейс (порты, ключи, консоль на 9001).
+  s3:
+    image: rustfs/rustfs:1.0.2
+    environment:
+      RUSTFS_ACCESS_KEY: mlops
+      RUSTFS_SECRET_KEY: mlops-secret
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [s3data:/data]
+
+  registry:
+    build: { context: ., dockerfile: deploy/registry.Dockerfile }
+    environment:
+      DATABASE_URL: postgres://mlops:mlops@postgres:5432/registry?sslmode=disable
+      S3_ENDPOINT: s3:9000
+      S3_ACCESS_KEY: mlops
+      S3_SECRET_KEY: mlops-secret
+      S3_BUCKET: models
+      REGISTRY_TOKEN: ${REGISTRY_TOKEN:-dev-token}
+    ports: ["8090:8090"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      s3: { condition: service_started }
+
+  inference:
+    build:
+      context: .
+      dockerfile: deploy/inference.Dockerfile
+      args: { RUN_TESTS: "false" }
+    environment:
+      REGISTRY_URL: http://registry:8090
+      MODEL_NAME: iris
+      REGISTRY_POLL_INTERVAL: 5s
+      MODEL_CACHE_DIR: /tmp/models
+    ports: ["8081:8080"]
+    depends_on: [registry]
+
+volumes:
+  pgdata:
+  s3data:

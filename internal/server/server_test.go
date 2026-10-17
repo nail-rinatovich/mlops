@@ -9,8 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"mlops/internal/model"
 )
@@ -138,38 +142,91 @@ func TestProbes(t *testing.T) {
 	}
 }
 
+// trackingPredictor ведёт себя как ONNX: после Close обращаться к нему нельзя.
+type trackingPredictor struct {
+	fakePredictor
+	closed   atomic.Bool
+	useAfter *atomic.Int64
+}
+
+func (p *trackingPredictor) Predict(ctx context.Context, b [][]float32) ([]model.Prediction, error) {
+	time.Sleep(200 * time.Microsecond) // имитация инференса: окно для гонки
+	if p.closed.Load() {
+		p.useAfter.Add(1)
+		return nil, errors.New("use after close")
+	}
+	return p.fakePredictor.Predict(ctx, b)
+}
+
+func (p *trackingPredictor) Close() error { p.closed.Store(true); return nil }
+
 func TestSetPredictorSwap(t *testing.T) {
 	s := newTestServer(nil)
-	first := &fakePredictor{md: testMeta}
-	if old := s.SetPredictor(first); old != nil {
-		t.Errorf("expected nil old predictor")
-	}
+	var useAfter atomic.Int64
+	first := &trackingPredictor{fakePredictor: fakePredictor{md: testMeta}, useAfter: &useAfter}
+	s.SetPredictor(first)
+
 	v2 := testMeta
 	v2.Version = "2"
-	if old := s.SetPredictor(&fakePredictor{md: v2}); old != first {
-		t.Errorf("expected first predictor to be returned")
+	s.SetPredictor(&trackingPredictor{fakePredictor: fakePredictor{md: v2}, useAfter: &useAfter})
+
+	if !first.closed.Load() {
+		t.Error("previous predictor must be closed after swap")
 	}
 	rec := do(t, s.Handler(), http.MethodGet, "/readyz", "")
 	if !strings.Contains(rec.Body.String(), `"version":"2"`) {
 		t.Errorf("expected version 2, got %s", rec.Body)
 	}
+
+	s.Close()
+	if rec := do(t, s.Handler(), http.MethodGet, "/readyz", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("after Close readyz = %d, want 503", rec.Code)
+	}
 }
 
-func TestRequestID(t *testing.T) {
-	h := newTestServer(nil).Handler()
-
-	rec := do(t, h, http.MethodGet, "/healthz", "")
-	if id := rec.Header().Get(requestIDHeader); len(id) != 16 {
-		t.Errorf("generated id %q, want 16 hex chars", id)
+// TestHotSwapUnderLoad: модель многократно подменяется во время параллельных запросов.
+// Ни один запрос не должен упасть и ни один не должен попасть в закрытую модель.
+func TestHotSwapUnderLoad(t *testing.T) {
+	s := newTestServer(nil)
+	var useAfter atomic.Int64
+	newPred := func(v int) *trackingPredictor {
+		md := testMeta
+		md.Version = strconv.Itoa(v)
+		return &trackingPredictor{fakePredictor: fakePredictor{md: md}, useAfter: &useAfter}
 	}
+	s.SetPredictor(newPred(1))
+	h := s.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	req.Header.Set(requestIDHeader, "abc-123")
-	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if id := rec.Header().Get(requestIDHeader); id != "abc-123" {
-		t.Errorf("propagated id = %q", id)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var total, failed atomic.Int64
+	for range 16 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rec := do(t, h, http.MethodPost, "/v1/predict", `{"instances":[[5.1,3.5,1.4,0.2]]}`)
+				total.Add(1)
+				if rec.Code != http.StatusOK {
+					failed.Add(1)
+				}
+			}
+		})
 	}
+	for v := 2; v <= 50; v++ {
+		time.Sleep(2 * time.Millisecond)
+		s.SetPredictor(newPred(v))
+	}
+	close(stop)
+	wg.Wait()
+
+	if failed.Load() != 0 || useAfter.Load() != 0 {
+		t.Fatalf("requests: %d, failed: %d, use-after-close: %d", total.Load(), failed.Load(), useAfter.Load())
+	}
+	t.Logf("requests: %d, swaps: 49, failed: 0", total.Load())
 }
 
 func BenchmarkPredictHandler(b *testing.B) {

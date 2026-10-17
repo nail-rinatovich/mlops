@@ -1,4 +1,9 @@
 // Команда inference — HTTP-сервис предсказаний поверх ONNX-модели.
+//
+// Два режима:
+//   - локальный (REGISTRY_URL не задан): модель читается из MODEL_DIR при старте;
+//   - реестр (REGISTRY_URL задан): модель скачивается из реестра и подменяется на лету,
+//     когда в реестре меняется production-версия.
 package main
 
 import (
@@ -13,6 +18,8 @@ import (
 
 	"mlops/internal/config"
 	"mlops/internal/model"
+	"mlops/internal/registryclient"
+	"mlops/internal/reloader"
 	"mlops/internal/server"
 )
 
@@ -41,18 +48,45 @@ func run() error {
 	}
 	defer model.DestroyRuntime()
 
-	start := time.Now()
-	pred, err := model.LoadONNX(cfg.ModelDir)
-	if err != nil {
-		return err
-	}
-	md := pred.Metadata()
-	log.Info("model loaded", "name", md.Name, "version", md.Version, "sha256", md.SHA256,
-		"load_ms", time.Since(start).Milliseconds())
-
 	srv := server.New(server.Options{MaxBatch: cfg.MaxBatch, MaxBodyBytes: cfg.MaxBodyBytes}, log)
-	srv.SetPredictor(pred)
-	defer pred.Close()
+	defer srv.Close() // выгружаем модель до DestroyRuntime (defer выполняются в обратном порядке)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	loadONNX := func(dir string) (model.Predictor, error) {
+		start := time.Now()
+		p, err := model.LoadONNX(dir)
+		if err != nil {
+			return nil, err
+		}
+		md := p.Metadata()
+		log.Info("model loaded", "name", md.Name, "version", md.Version, "sha256", md.SHA256,
+			"load_ms", time.Since(start).Milliseconds())
+		return p, nil
+	}
+
+	// rlDone закрывается, когда reloader завершился: до этого нельзя выгружать модель,
+	// иначе он может успеть поставить новую уже после srv.Close().
+	rlDone := make(chan struct{})
+	defer func() { stop(); <-rlDone }() // выполнится раньше srv.Close: defer идут в обратном порядке
+	if cfg.RegistryURL == "" {
+		close(rlDone)
+		p, err := loadONNX(cfg.ModelDir)
+		if err != nil {
+			return err
+		}
+		srv.SetPredictor(p)
+	} else {
+		// Сервер стартует сразу, а /readyz отвечает 503, пока не загрузится первая модель.
+		client := registryclient.New(cfg.RegistryURL, "", &http.Client{Timeout: 5 * time.Minute})
+		rl := reloader.New(client, srv, loadONNX, cfg.ModelName, cfg.CacheDir, cfg.PollInterval, log)
+		log.Info("registry mode", "registry", cfg.RegistryURL, "model", cfg.ModelName, "poll", cfg.PollInterval.String())
+		go func() {
+			defer close(rlDone)
+			rl.Run(ctx)
+		}()
+	}
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,
@@ -62,9 +96,6 @@ func run() error {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
